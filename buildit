@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  buildit  —  Tiered two-agent build orchestrator (Claude Code × Gemini CLI)
+# =============================================================================
+#  USAGE:   buildit <low|med|high> "what to build"
+#           buildit "what to build"          # defaults to 'med'
+#           buildit status                   # progress of the run in this dir
+#           buildit reset                    # wipe this dir's orchestration state
+#
+#  The TIER (low/med/high) scales everything together — models, debate rounds,
+#  agent turns, verification depth, and how hard each model is told to think:
+#       low  = cheap/fast models, minimal rounds  → quick drafts, low spend
+#       med  = balanced                            → the daily driver
+#       high = best models, more rounds & rigor    → important / hard builds
+#
+#  PER-DIRECTORY MEMORY: state + a running journal live in ./.orchestration/.
+#  Re-run in the same directory and it RESUMES automatically from where it
+#  stopped (each phase summarised into PROGRESS.md as it completes). Pass
+#  --restart to start fresh.
+#
+#  Everything stays under YOUR git: agents are told not to commit; the
+#  orchestrator's commits carry no AI co-author trailer; .orchestration/ is
+#  git-ignored so the journal never clutters your history.
+#
+#  Pipeline: Research → Cross-Debate → Consensus+Task-Split → Build →
+#            Cross-Verify → Integrate+Test → Finalize
+#
+#  Requires: claude (Claude Code), gemini (Gemini CLI — see migration note), git.
+#  Configure once in ~/.config/ai-duet/config; per-project in ./.aiduetrc.
+# =============================================================================
+#  ⚠ GEMINI CLI DEPRECATION (verified 2026-06): the individual / AI Pro / Ultra
+#    tiers of the `gemini` CLI stop serving on 2026-06-18, migrating to the
+#    Antigravity CLI. When you migrate, just set GEMINI_BIN + the T_*_gemini
+#    model strings in your config — the rest of this script is agent-agnostic.
+#  ⚠ CLAUDE BILLING (2026-06-15): headless `claude -p` on Pro plans draws from a
+#    separate monthly "Agent SDK credit" pool, not your interactive limit.
+# =============================================================================
+
+set -uo pipefail   # NOT -e: agent calls can fail (rate limits) and we retry.
+
+# -----------------------------------------------------------------------------
+# 0. BASE CONFIG  (override any of this in ~/.config/ai-duet/config or ./.aiduetrc)
+# -----------------------------------------------------------------------------
+CLAUDE_BIN="claude"          # Claude Code CLI command
+GEMINI_BIN="gemini"          # second-agent command (→ antigravity after migration)
+
+DEFAULT_TIER="med"           # used when no tier word is given
+
+# --- TIER PRESETS  -----------------------------------------------------------
+# Each tier sets: claude model, gemini model, debate rounds, claude max-turns,
+# convergence early-exit, verify passes (1 or 2), and an "effort" directive that
+# is appended to every prompt to dial thinking depth up or down.
+#
+# Models — defaults are KNOWN-VALID strings. To go newer/best when you have access:
+#   Claude  : haiku | sonnet | opus  (stable aliases → latest in family).
+#             For the Mythos tier set e.g. T_high_claude="claude-fable-5".
+#   Gemini  : gemini-2.5-flash | gemini-2.5-pro are safe today. If you have
+#             Gemini 3, set T_high_gemini="gemini-3-pro" (or use the CLI's
+#             Auto-3 routing). After the Antigravity migration, set the
+#             Antigravity model strings here instead.
+T_low_claude="haiku";    T_low_gemini="gemini-2.5-flash"
+T_low_rounds=1;          T_low_turns=12;  T_low_converge=false; T_low_verify=1
+T_low_effort="Optimise for speed and a minimal working solution. Keep analysis brief; do not gold-plate."
+
+T_med_claude="sonnet";   T_med_gemini="gemini-2.5-pro"
+T_med_rounds=2;          T_med_turns=25;  T_med_converge=true;  T_med_verify=2
+T_med_effort="Balance speed with correctness. Cover the important edge cases and keep the design clean."
+
+T_high_claude="opus";    T_high_gemini="gemini-2.5-pro"
+T_high_rounds=3;         T_high_turns=50; T_high_converge=true; T_high_verify=2
+T_high_effort="Maximise rigour: think deeply, enumerate edge cases, justify trade-offs, and aim for production quality."
+
+# --- Per-phase tool permissions ----------------------------------------------
+#   Claude: plan | acceptEdits | bypassPermissions | default
+#   Gemini: plan | auto_edit | default | yolo
+CLAUDE_PLAN_FLAGS="--permission-mode plan"
+CLAUDE_BUILD_FLAGS="--permission-mode acceptEdits --allowedTools Read,Write,Edit,Bash"
+GEMINI_PLAN_FLAGS="--approval-mode plan"
+GEMINI_BUILD_FLAGS="--approval-mode auto_edit"
+
+# --- Behaviour ----------------------------------------------------------------
+HUMAN_GATES=true          # pause for y/n between major phases
+RUN_TESTS=true            # integrate phase tries to build/run the project
+PARALLEL_BUILD=false      # both builders at once (only if tasks are file-disjoint)
+AUTO_COMMIT=true          # orchestrator commits code (clean, no AI co-author)
+JOURNAL_DIGEST=false      # true = spend a cheap model call to summarise each phase
+                          # false = free: capture each agent's own printed summary
+LEAD="claude"             # which agent integrates at the end
+AUTO_YOLO=false           # set by --yolo: no gates + full auto-approval
+
+# --- Reliability / pacing -----------------------------------------------------
+MAX_RETRIES=3
+BACKOFF_SECONDS=15
+PACE_SECONDS=4
+AGENT_TIMEOUT=900         # per-call wall-clock seconds; 0 = none
+
+# -----------------------------------------------------------------------------
+#  Runtime state (set during init — leave alone)
+# -----------------------------------------------------------------------------
+TIER=""; IDEA=""; SUBCMD=""
+PROJECT_DIR="."; ORCH_DIR=""; STATE_FILE=""; LOG_FILE=""; PROGRESS=""
+RESTART=false; FORCE=false; DRY_RUN=false
+OPT_ROUNDS=""; OPT_LEAD=""    # explicit flag overrides (win over tier)
+START_TS="$(date +%Y%m%d-%H%M%S)"
+# Derived-from-tier (filled by apply_tier):
+CLAUDE_MODEL=""; GEMINI_MODEL=""; DEBATE_ROUNDS=""; CLAUDE_MAX_TURNS=""
+CONVERGENCE_CHECK=""; VERIFY_PASSES=""; EFFORT=""
+
+# =============================================================================
+# 1. UTILITIES   (all status output → STDERR so it never pollutes captured stdout)
+# =============================================================================
+c_reset=$'\e[0m'; c_dim=$'\e[2m'; c_bold=$'\e[1m'
+c_blue=$'\e[34m'; c_green=$'\e[32m'; c_yellow=$'\e[33m'; c_red=$'\e[31m'; c_cyan=$'\e[36m'
+
+log()  { printf '%s %s\n' "${c_dim}[$(date +%H:%M:%S)]${c_reset}" "$*" >&2
+         [[ -n "$LOG_FILE" ]] && printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG_FILE"; }
+say()  { printf '\n%s\n' "${c_blue}${c_bold}$*${c_reset}" >&2; }
+ok()   { printf '%s\n' "${c_green}✔ $*${c_reset}" >&2; }
+warn() { printf '%s\n' "${c_yellow}⚠ $*${c_reset}" >&2; }
+die()  { printf '%s\n' "${c_red}✘ $*${c_reset}" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found in PATH. Install it or fix the *_BIN config."; }
+
+confirm() {
+  local prompt="$1" ans
+  $AUTO_YOLO && return 0
+  $HUMAN_GATES || return 0
+  printf '%s %s [Y/n] ' "${c_yellow}❓${c_reset}" "$prompt" >&2
+  read -r ans </dev/tty || ans="y"
+  [[ -z "$ans" || "$ans" =~ ^[Yy] ]]
+}
+
+mark_done() { echo "$1" >>"$STATE_FILE"; }
+is_done()   { $FORCE && return 1; grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
+
+git_snapshot() {
+  $AUTO_COMMIT || return 0
+  local msg="$1"
+  git -C "$PROJECT_DIR" add -A
+  if ! git -C "$PROJECT_DIR" diff --cached --quiet; then
+    git -C "$PROJECT_DIR" commit --quiet -m "$msg" && log "git: committed → $msg"
+  fi
+}
+
+# Append a timestamped entry to the per-directory journal. $1=heading, stdin=body.
+journal() {
+  local heading="$1"
+  { printf '\n## %s — %s\n\n' "$heading" "$(date '+%Y-%m-%d %H:%M')"
+    cat
+    printf '\n'; } >>"$PROGRESS"
+}
+
+# Summarise a just-finished phase into PROGRESS.md.
+#   $1 = phase label, $2 = file containing the agent's raw output for that phase.
+# Free mode: keep a trimmed head+tail of the agent's own words.
+# Digest mode (JOURNAL_DIGEST=true): one cheap model call → 3 bullet summary.
+journal_phase() {
+  local label="$1" src="$2"
+  [[ -f "$src" ]] || { printf 'Phase completed.' | journal "$label"; return; }
+  if $JOURNAL_DIGEST; then
+    local d
+    d="$(CLAUDE_MODEL="$T_low_claude" run_agent claude plan \
+        "Summarise the STDIN content in at most 3 terse bullets capturing decisions/outputs. No preamble." \
+        "$src" 2>/dev/null)"
+    [[ -n "$d" ]] && { printf '%s' "$d" | journal "$label"; return; }
+  fi
+  # Free fallback: head + tail of the agent's output.
+  { head -n 8 "$src"; echo '…'; tail -n 4 "$src"; } | journal "$label"
+}
+
+# =============================================================================
+# 2. AGENT RUNNER
+# =============================================================================
+#  run_agent <claude|gemini> <plan|build> "<instruction>" [context_file]
+#   Runs inside PROJECT_DIR. context_file (optional) → STDIN as reference.
+#   plan  : read-only, STDOUT is the deliverable (callers capture it).
+#   build : writes files in the repo; STDOUT is a work log / self-summary.
+#   The tier EFFORT directive is appended to every instruction.
+#   Retries with backoff; paces after success. Echoes STDOUT on success.
+# -----------------------------------------------------------------------------
+run_agent() {
+  local agent="$1" mode="$2" instruction="$3" ctx="${4:-}"
+  local bin flags model_flag out rc attempt=0 tcmd=()
+
+  # Tier effort guidance rides along on every call.
+  [[ -n "$EFFORT" ]] && instruction="${instruction}
+
+[Effort guidance: ${EFFORT}]"
+
+  case "$agent" in
+    claude) bin="$CLAUDE_BIN"; model_flag="${CLAUDE_MODEL:+--model $CLAUDE_MODEL}" ;;
+    gemini) bin="$GEMINI_BIN"; model_flag="${GEMINI_MODEL:+--model $GEMINI_MODEL}" ;;
+    *) die "run_agent: unknown agent '$agent'" ;;
+  esac
+  case "$agent:$mode" in
+    claude:plan)  flags="$CLAUDE_PLAN_FLAGS" ;;
+    claude:build) flags="$CLAUDE_BUILD_FLAGS"; $AUTO_YOLO && flags="--permission-mode bypassPermissions --allowedTools Read,Write,Edit,Bash" ;;
+    gemini:plan)  flags="$GEMINI_PLAN_FLAGS" ;;
+    gemini:build) flags="$GEMINI_BUILD_FLAGS"; $AUTO_YOLO && flags="--yolo" ;;
+    *) die "run_agent: bad mode '$mode'" ;;
+  esac
+  # Claude turn budget scales with tier.
+  [[ "$agent" == claude && -n "$CLAUDE_MAX_TURNS" ]] && flags="$flags --max-turns $CLAUDE_MAX_TURNS"
+
+  [[ "$AGENT_TIMEOUT" -gt 0 ]] && command -v timeout >/dev/null && tcmd=(timeout "$AGENT_TIMEOUT")
+
+  while :; do
+    attempt=$((attempt+1))
+    log "→ ${c_bold}${agent}${c_reset} [${mode}] ${c_dim}(${CLAUDE_MODEL:-}${GEMINI_MODEL:-})${c_reset} attempt ${attempt}/${MAX_RETRIES}"
+    if [[ -n "$ctx" && -f "$ctx" ]]; then
+      out="$( cd "$PROJECT_DIR" && "${tcmd[@]}" "$bin" -p "$instruction" $model_flag $flags <"$ctx" 2>>"$LOG_FILE" )"
+    else
+      out="$( cd "$PROJECT_DIR" && "${tcmd[@]}" "$bin" -p "$instruction" $model_flag $flags </dev/null 2>>"$LOG_FILE" )"
+    fi
+    rc=$?
+    if [[ $rc -eq 0 ]]; then printf '%s' "$out"; sleep "$PACE_SECONDS"; return 0; fi
+    if [[ $attempt -ge $MAX_RETRIES ]]; then
+      log "${c_red}‼ ${agent} failed after ${attempt} attempts (rc=${rc}). See $LOG_FILE${c_reset}"; return "$rc"
+    fi
+    local wait_s=$(( BACKOFF_SECONDS * attempt ))
+    warn "${agent} call failed (rc=${rc}) — likely a rate limit / transient error. Retrying in ${wait_s}s…"
+    sleep "$wait_s"
+  done
+}
+
+# =============================================================================
+# 3. PHASES
+# =============================================================================
+phase_research() {
+  is_done research && { ok "Research — cached, skipping."; return; }
+  say "PHASE 1 · Independent research"
+  local p="You are a senior software architect. Read .orchestration/IDEA.md for the brief.
+Produce a rigorous architecture proposal: tech stack (justified), component breakdown,
+data model, key risks/edge cases, and a phased implementation plan. Concrete and
+opinionated. Do NOT write code yet. Output Markdown only."
+  run_agent claude plan "$p" >"$ORCH_DIR/research_claude.md" || die "Claude research failed."
+  run_agent gemini plan "$p" >"$ORCH_DIR/research_gemini.md" || die "Gemini research failed."
+  ok "Two independent proposals written."
+  journal_phase "Phase 1 · Research (Claude)" "$ORCH_DIR/research_claude.md"
+  git_snapshot "orchestration: phase 1 research"
+  mark_done research
+}
+
+phase_debate() {
+  is_done debate && { ok "Debate — cached, skipping."; return; }
+  say "PHASE 2 · Cross-debate (${DEBATE_ROUNDS} round(s))"
+  local round
+  for (( round=1; round<=DEBATE_ROUNDS; round++ )); do
+    log "Round ${round}: each agent critiques the other's current proposal."
+    local crit="You are a principal engineer doing an adversarial design review. The other
+architect's proposal is on STDIN. Identify concrete flaws, missing edge cases,
+security/perf blind spots, and unstated assumptions, then list specific actionable
+improvements. Be blunt and specific. Markdown only."
+    run_agent claude plan "$crit" "$ORCH_DIR/research_gemini.md" >"$ORCH_DIR/critique_by_claude_r${round}.md" || die "Claude critique failed."
+    run_agent gemini plan "$crit" "$ORCH_DIR/research_claude.md" >"$ORCH_DIR/critique_by_gemini_r${round}.md" || die "Gemini critique failed."
+
+    local revise="On STDIN is your previous proposal followed by a peer critique of it
+(delimited). Produce a REVISED proposal that fixes valid points and explicitly notes any
+critique you reject and why. Markdown only."
+    { echo "## YOUR PREVIOUS PROPOSAL"; cat "$ORCH_DIR/research_claude.md"
+      echo; echo "## PEER CRITIQUE OF IT"; cat "$ORCH_DIR/critique_by_gemini_r${round}.md"; } >"$ORCH_DIR/_rev_c.tmp"
+    run_agent claude plan "$revise" "$ORCH_DIR/_rev_c.tmp" >"$ORCH_DIR/research_claude.md.new" \
+      && mv "$ORCH_DIR/research_claude.md.new" "$ORCH_DIR/research_claude.md"
+    { echo "## YOUR PREVIOUS PROPOSAL"; cat "$ORCH_DIR/research_gemini.md"
+      echo; echo "## PEER CRITIQUE OF IT"; cat "$ORCH_DIR/critique_by_claude_r${round}.md"; } >"$ORCH_DIR/_rev_g.tmp"
+    run_agent gemini plan "$revise" "$ORCH_DIR/_rev_g.tmp" >"$ORCH_DIR/research_gemini.md.new" \
+      && mv "$ORCH_DIR/research_gemini.md.new" "$ORCH_DIR/research_gemini.md"
+    rm -f "$ORCH_DIR"/_rev_*.tmp
+
+    if [[ "$CONVERGENCE_CHECK" == true ]]; then
+      { echo "## PLAN A"; cat "$ORCH_DIR/research_claude.md"; echo; echo "## PLAN B"; cat "$ORCH_DIR/research_gemini.md"; } >"$ORCH_DIR/_conv.tmp"
+      local verdict
+      verdict="$(run_agent claude plan "On STDIN are two revised plans. Do they materially agree on stack, structure and approach? Reply with exactly one word: CONVERGED or CONTINUE." "$ORCH_DIR/_conv.tmp")"
+      rm -f "$ORCH_DIR/_conv.tmp"
+      log "Convergence verdict: ${verdict}"
+      grep -qi CONVERGED <<<"$verdict" && { ok "Plans converged early (round ${round})."; break; }
+    fi
+  done
+  journal_phase "Phase 2 · Debate" "$ORCH_DIR/research_claude.md"
+  git_snapshot "orchestration: phase 2 debate"
+  mark_done debate
+}
+
+phase_consensus() {
+  is_done consensus && { ok "Consensus — cached, skipping."; return; }
+  say "PHASE 3 · Consensus spec + task division"
+  { echo "# BRIEF"; cat "$ORCH_DIR/IDEA.md"
+    echo; echo "# PLAN — CLAUDE"; cat "$ORCH_DIR/research_claude.md"
+    echo; echo "# PLAN — GEMINI"; cat "$ORCH_DIR/research_gemini.md"; } >"$ORCH_DIR/_cons.tmp"
+  local p="You are the lead architect. STDIN has the brief and two peer-reviewed plans.
+Merge them into ONE definitive spec with these exact headings, in order:
+
+# Specification
+(unified architecture, stack, data model, conventions)
+# File / Directory Layout
+(the intended tree so both builders agree on structure)
+# Task Division
+## Task: Claude
+(precise list of files/modules CLAUDE builds)
+## Task: Gemini
+(precise list of files/modules GEMINI builds — must NOT overlap Claude's files)
+# Integration Contract
+(the interfaces/APIs/types where the two halves meet)
+
+Make the two task sets touch DISJOINT files wherever possible. Markdown only."
+  run_agent "$LEAD" plan "$p" "$ORCH_DIR/_cons.tmp" >"$ORCH_DIR/SPEC.md" || die "Consensus generation failed."
+  rm -f "$ORCH_DIR/_cons.tmp"
+  local other; [[ "$LEAD" == claude ]] && other=gemini || other=claude
+  run_agent "$other" plan "STDIN is the final consensus spec. Confirm the task split is buildable and
+file ownership is non-overlapping. If you see a conflict/gap output a short 'BLOCKERS' list, else 'ACKNOWLEDGED'. Markdown only." \
+    "$ORCH_DIR/SPEC.md" >"$ORCH_DIR/spec_ack_${other}.md" || warn "Ack step failed (non-fatal)."
+  ok "Unified spec → .orchestration/SPEC.md"; cat "$ORCH_DIR/SPEC.md" >&2
+  journal_phase "Phase 3 · Consensus spec" "$ORCH_DIR/SPEC.md"
+  git_snapshot "orchestration: phase 3 consensus spec"
+  mark_done consensus
+  confirm "Review SPEC.md above. Proceed to BUILD?" || die "Stopped before build. Re-run in this dir to resume."
+}
+
+_build_one() {
+  local agent="$1"
+  local p="You are building part of a project. Read .orchestration/SPEC.md in full and
+.orchestration/PROGRESS.md for prior context. Implement ONLY the section under
+'## Task: ${agent^}'. Honour the Integration Contract and File/Directory Layout exactly.
+Create real files in this repository. Clean, commented, production-quality code. Do NOT
+touch files assigned to the other agent. Do NOT run git commit. End with a short summary
+of the files you created."
+  run_agent "$agent" build "$p" || die "${agent} build failed."
+}
+
+phase_build() {
+  is_done build && { ok "Build — cached, skipping."; return; }
+  say "PHASE 4 · Build  ($([ "$PARALLEL_BUILD" = true ] && echo parallel || echo sequential))"
+  : >"$ORCH_DIR/build_log.md"
+  if $PARALLEL_BUILD; then
+    warn "Parallel build: ensure the task split is file-disjoint."
+    _build_one claude >>"$ORCH_DIR/build_log.md" & local pc=$!
+    _build_one gemini >>"$ORCH_DIR/build_log.md" & local pg=$!
+    wait "$pc"; wait "$pg"
+  else
+    _build_one claude | tee -a "$ORCH_DIR/build_log.md" >/dev/null
+    git_snapshot "build: Claude's tasks"
+    _build_one gemini | tee -a "$ORCH_DIR/build_log.md" >/dev/null
+  fi
+  ok "Build complete."
+  journal_phase "Phase 4 · Build" "$ORCH_DIR/build_log.md"
+  git_snapshot "build: Gemini's tasks"
+  mark_done build
+}
+
+phase_verify() {
+  is_done verify && { ok "Verify — cached, skipping."; return; }
+  say "PHASE 5 · Cross-verification (${VERIFY_PASSES} pass(es))"
+  : >"$ORCH_DIR/verify_log.md"
+  local vp="Read .orchestration/SPEC.md, then review the ENTIRE repository against it.
+Find and FIX in place: bugs, security flaws, missing error handling, contract violations
+between the two halves, dead/incomplete code. Minimal, correct edits directly to files.
+Do NOT commit. Print a concise changelog of what you fixed."
+  # Sequential on purpose (two passes over the same repo would conflict if parallel).
+  log "Gemini hardening pass…"
+  run_agent gemini build "$vp" | tee -a "$ORCH_DIR/verify_log.md" >/dev/null || warn "Gemini verify had issues."
+  git_snapshot "verify: Gemini hardening pass"
+  if [[ "$VERIFY_PASSES" -ge 2 ]]; then
+    log "Claude hardening pass…"
+    run_agent claude build "$vp" | tee -a "$ORCH_DIR/verify_log.md" >/dev/null || warn "Claude verify had issues."
+    git_snapshot "verify: Claude hardening pass"
+  fi
+  ok "Cross-verification complete."
+  journal_phase "Phase 5 · Verify" "$ORCH_DIR/verify_log.md"
+  mark_done verify
+}
+
+phase_integrate() {
+  is_done integrate && { ok "Integrate — cached, skipping."; return; }
+  say "PHASE 6 · Integration + test (lead: ${LEAD})"
+  local testline="Then make it runnable: dependency manifest, build/run instructions, and a
+smoke test or minimal suite. Run the build and tests; if they fail, fix and re-run until
+green (or clearly report what's blocking)."
+  $RUN_TESTS || testline="Then write a clear README with setup/run instructions (do not execute builds)."
+  local p="You are the integrator. Read .orchestration/SPEC.md and the whole repo. Wire the
+two halves together so the project is coherent and runnable end-to-end: reconcile
+imports/interfaces, remove duplication, add README.md and any glue/config. ${testline}
+Do NOT commit. Print a final status report: what works, what's stubbed, any TODOs."
+  run_agent "$LEAD" build "$p" >"$ORCH_DIR/integrate_log.md" || warn "Integration had issues."
+  ok "Integration complete."
+  journal_phase "Phase 6 · Integrate" "$ORCH_DIR/integrate_log.md"
+  git_snapshot "integrate: wire-up, README, tests"
+  mark_done integrate
+}
+
+phase_finalize() {
+  say "DONE · Summary"
+  ok "Project : $PROJECT_DIR"
+  ok "Journal : $PROGRESS"
+  ok "Log     : $LOG_FILE"
+  printf '\n%s\n' "${c_bold}Recent commits:${c_reset}" >&2
+  git -C "$PROJECT_DIR" --no-pager log --oneline -n 12 2>/dev/null >&2 || true
+  command -v notify-send >/dev/null 2>&1 && notify-send "buildit ✔" "Finished in $(basename "$PROJECT_DIR")" 2>/dev/null || true
+  warn "All commits are under YOUR git identity — review, then push when ready."
+}
+
+# =============================================================================
+# 4. SUBCOMMANDS
+# =============================================================================
+cmd_status() {
+  ORCH_DIR="$PROJECT_DIR/.orchestration"
+  [[ -d "$ORCH_DIR" ]] || die "No run found in $(pwd). Start one with: buildit <low|med|high> \"...\""
+  say "Status for $PROJECT_DIR"
+  if [[ -f "$ORCH_DIR/state" ]]; then
+    printf '%s\n' "${c_bold}Completed phases:${c_reset}" >&2
+    sed 's/^/  ✔ /' "$ORCH_DIR/state" >&2
+  fi
+  if [[ -f "$ORCH_DIR/PROGRESS.md" ]]; then
+    printf '\n%s\n' "${c_bold}Journal tail:${c_reset}" >&2
+    tail -n 25 "$ORCH_DIR/PROGRESS.md" >&2
+  fi
+}
+
+cmd_reset() {
+  ORCH_DIR="$PROJECT_DIR/.orchestration"
+  [[ -d "$ORCH_DIR" ]] || die "Nothing to reset in $(pwd)."
+  confirm "Delete $ORCH_DIR and start fresh next run?" || { warn "Cancelled."; return; }
+  rm -rf "$ORCH_DIR"; ok "Cleared. Next run starts from scratch."
+}
+
+# =============================================================================
+# 5. CONFIG / TIER / INIT / ARGS
+# =============================================================================
+load_overrides() {
+  local f
+  for f in "${XDG_CONFIG_HOME:-$HOME/.config}/ai-duet/config" "./.aiduetrc"; do
+    # shellcheck disable=SC1090
+    [[ -f "$f" ]] && { source "$f" && log "Loaded config overrides from $f"; }
+  done
+}
+
+apply_tier() {
+  local t="$1"
+  local mc="T_${t}_claude" mg="T_${t}_gemini" mr="T_${t}_rounds" mt="T_${t}_turns"
+  local mv="T_${t}_converge" mp="T_${t}_verify" me="T_${t}_effort"
+  CLAUDE_MODEL="${!mc}"; GEMINI_MODEL="${!mg}"; DEBATE_ROUNDS="${!mr}"
+  CLAUDE_MAX_TURNS="${!mt}"; CONVERGENCE_CHECK="${!mv}"; VERIFY_PASSES="${!mp}"; EFFORT="${!me}"
+  # Explicit flags beat the tier.
+  [[ -n "$OPT_ROUNDS" ]] && DEBATE_ROUNDS="$OPT_ROUNDS"
+  [[ -n "$OPT_LEAD"   ]] && LEAD="$OPT_LEAD"
+}
+
+usage() {
+cat >&2 <<EOF
+${c_bold}buildit${c_reset} — tiered two-agent build orchestrator (Claude Code × Gemini CLI)
+
+USAGE:
+  buildit <low|med|high> "what to build"     run at a tier (default: ${DEFAULT_TIER})
+  buildit "what to build"                    run at the default tier
+  buildit status                             show progress for this directory
+  buildit reset                              wipe this directory's run state
+
+TIERS scale models, debate rounds, turns, verify depth and thinking effort:
+  low   ${T_low_claude} / ${T_low_gemini}    rounds=${T_low_rounds}
+  med   ${T_med_claude} / ${T_med_gemini}   rounds=${T_med_rounds}
+  high  ${T_high_claude} / ${T_high_gemini}   rounds=${T_high_rounds}
+
+OPTIONS:
+  -d, --dir <path>   Work in <path> instead of the current directory
+      --restart      Ignore saved state; start the run over
+      --dry-run      Show the plan (tier, models, phases) and exit
+      --rounds <n>   Override debate rounds for this run
+      --lead <a>     Integrator agent: claude | gemini
+      --no-gates     Don't pause between phases
+      --no-tests     Skip build/test execution in the integrate phase
+      --parallel     Build both task sets concurrently (file-disjoint only)
+  -y, --yolo         Full auto: no gates + agents auto-approve everything
+  -h, --help         This help
+
+MEMORY: state + journal live in ./.orchestration/. Re-running in the same dir
+RESUMES automatically. Config: ~/.config/ai-duet/config and ./.aiduetrc (flags win).
+EOF
+}
+
+parse_args() {
+  local pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--dir)   PROJECT_DIR="$2"; shift 2 ;;
+      --restart)  RESTART=true; FORCE=true; shift ;;
+      --dry-run)  DRY_RUN=true; shift ;;
+      --rounds)   OPT_ROUNDS="$2"; shift 2 ;;
+      --lead)     OPT_LEAD="$2"; shift 2 ;;
+      --no-gates) HUMAN_GATES=false; shift ;;
+      --no-tests) RUN_TESTS=false; shift ;;
+      --parallel) PARALLEL_BUILD=true; shift ;;
+      -y|--yolo)  AUTO_YOLO=true; HUMAN_GATES=false; shift ;;
+      -r|--resume) shift ;;                       # resume is now the default; accepted as a no-op
+      -h|--help)  usage; exit 0 ;;
+      -*)         die "Unknown option: $1  (try --help)" ;;
+      *)          pos+=("$1"); shift ;;
+    esac
+  done
+  # First positional may be a subcommand or a tier; the rest is the idea.
+  if [[ ${#pos[@]} -gt 0 ]]; then
+    case "${pos[0]}" in
+      status|reset) SUBCMD="${pos[0]}" ;;
+      low|med|high) TIER="${pos[0]}"; IDEA="${pos[*]:1}" ;;
+      *)            TIER="$DEFAULT_TIER"; IDEA="${pos[*]}" ;;
+    esac
+  fi
+  [[ -n "$OPT_LEAD" && "$OPT_LEAD" != claude && "$OPT_LEAD" != gemini ]] && die "--lead must be claude or gemini."
+}
+
+init_workspace() {
+  need git; need "$CLAUDE_BIN"; need "$GEMINI_BIN"
+  PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)" || die "Directory not found."
+  ORCH_DIR="$PROJECT_DIR/.orchestration"
+  $RESTART && [[ -d "$ORCH_DIR" ]] && { rm -rf "$ORCH_DIR"; log "Restarted: cleared previous state."; }
+  mkdir -p "$ORCH_DIR"
+  STATE_FILE="$ORCH_DIR/state"; PROGRESS="$ORCH_DIR/PROGRESS.md"
+  LOG_FILE="$ORCH_DIR/run-${START_TS}.log"; : >"$LOG_FILE"; touch "$STATE_FILE" "$PROGRESS"
+
+  if [[ ! -d "$PROJECT_DIR/.git" ]]; then git -C "$PROJECT_DIR" init -q; log "Initialised git repo."; fi
+  mkdir -p "$PROJECT_DIR/.claude"
+  [[ -f "$PROJECT_DIR/.claude/settings.json" ]] || printf '{\n  "includeCoAuthoredBy": false\n}\n' >"$PROJECT_DIR/.claude/settings.json"
+  grep -qxF '.orchestration/' "$PROJECT_DIR/.gitignore" 2>/dev/null || echo '.orchestration/' >>"$PROJECT_DIR/.gitignore"
+  git -C "$PROJECT_DIR" config user.name  >/dev/null 2>&1 || warn "git user.name not set — git config --global user.name 'You'"
+  git -C "$PROJECT_DIR" config user.email >/dev/null 2>&1 || warn "git user.email not set — git config --global user.email you@example.com"
+
+  # Capture / reuse the brief.
+  if [[ -n "$IDEA" ]]; then
+    printf '%s\n' "$IDEA" >"$ORCH_DIR/IDEA.md"
+  elif [[ -f "$ORCH_DIR/IDEA.md" ]]; then
+    IDEA="$(cat "$ORCH_DIR/IDEA.md")"; log "Reusing existing brief for resume."
+  else
+    printf '%s' "${c_bold}Describe what to build: ${c_reset}" >&2; read -r IDEA </dev/tty
+    [[ -n "$IDEA" ]] || die "No build brief provided."; printf '%s\n' "$IDEA" >"$ORCH_DIR/IDEA.md"
+  fi
+}
+
+banner() {
+  say "════════════════════════════════════════════════"
+  printf '%s\n' "${c_blue}${c_bold}  buildit · tier=${TIER} · Claude×Gemini${c_reset}" >&2
+  say "════════════════════════════════════════════════"
+  printf '  %sBrief :%s %s\n'  "$c_bold" "$c_reset" "$IDEA" >&2
+  printf '  %sDir   :%s %s\n'  "$c_bold" "$c_reset" "$PROJECT_DIR" >&2
+  printf '  %sModels:%s claude=%s  gemini=%s\n' "$c_bold" "$c_reset" "$CLAUDE_MODEL" "$GEMINI_MODEL" >&2
+  printf '  %sFlow  :%s rounds=%s turns=%s verify=%s lead=%s gates=%s yolo=%s\n' \
+    "$c_bold" "$c_reset" "$DEBATE_ROUNDS" "$CLAUDE_MAX_TURNS" "$VERIFY_PASSES" "$LEAD" "$HUMAN_GATES" "$AUTO_YOLO" >&2
+  # Resume hint
+  if [[ -s "$STATE_FILE" ]]; then
+    printf '  %sResume:%s already done → %s\n' "$c_cyan" "$c_reset" "$(paste -sd', ' "$STATE_FILE")" >&2
+  fi
+}
+
+main() {
+  load_overrides            # defaults < ~/.config/ai-duet/config < ./.aiduetrc
+  parse_args "$@"           # flags + positional (tier/idea/subcommand)
+
+  # Subcommands don't need the full pipeline.
+  if [[ -n "$SUBCMD" ]]; then
+    PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)" || die "Directory not found."
+    case "$SUBCMD" in status) cmd_status ;; reset) cmd_reset ;; esac
+    exit 0
+  fi
+
+  [[ -z "$TIER" ]] && TIER="$DEFAULT_TIER"
+  [[ "$TIER" == low || "$TIER" == med || "$TIER" == high ]] || die "Tier must be low, med, or high."
+  apply_tier "$TIER"
+  init_workspace
+  banner
+
+  if $DRY_RUN; then
+    say "DRY RUN — no agents called."
+    printf 'Would run 6 phases at tier %s with the models/flow above.\n' "$TIER" >&2
+    exit 0
+  fi
+
+  phase_research
+  confirm "Continue to cross-debate?" || die "Paused. Re-run in this dir to resume."
+  phase_debate
+  phase_consensus           # has its own gate before build
+  phase_build
+  confirm "Build done. Continue to cross-verification?" || die "Paused. Re-run in this dir to resume."
+  phase_verify
+  phase_integrate
+  phase_finalize
+}
+
+main "$@"
