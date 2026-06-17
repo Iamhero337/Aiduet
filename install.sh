@@ -64,7 +64,7 @@ if [[ ! -f "$CFG_DIR/config" ]]; then
 # T_med_gemini="gemini-2.5-flash"
 
 # --- Behaviour ---------------------------------------------------------------
-# HUMAN_GATES=true        # set false to stop pausing between phases
+# HUMAN_GATES=false       # default is false (no pausing); set true to add gates
 # PACE_SECONDS=4          # raise to nurse the claude -p Agent SDK credit pool
 # AUTO_COMMIT=true        # orchestrator commits code (clean, no AI co-author)
 # JOURNAL_DIGEST=false    # true = spend a cheap call to summarise each phase

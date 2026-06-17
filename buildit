@@ -59,27 +59,27 @@ DEFAULT_TIER="med"           # used when no tier word is given
 #             Auto-3 routing). After the Antigravity migration, set the
 #             Antigravity model strings here instead.
 T_low_claude="haiku";    T_low_gemini="gemini-2.5-flash"
-T_low_rounds=1;          T_low_turns=12;  T_low_converge=false; T_low_verify=1
+T_low_rounds=1;          T_low_turns=8;   T_low_build_turns=40;  T_low_converge=false; T_low_verify=1
 T_low_effort="Optimise for speed and a minimal working solution. Keep analysis brief; do not gold-plate."
 
 T_med_claude="sonnet";   T_med_gemini="gemini-2.5-pro"
-T_med_rounds=2;          T_med_turns=25;  T_med_converge=true;  T_med_verify=2
+T_med_rounds=2;          T_med_turns=15;  T_med_build_turns=100; T_med_converge=true;  T_med_verify=2
 T_med_effort="Balance speed with correctness. Cover the important edge cases and keep the design clean."
 
 T_high_claude="opus";    T_high_gemini="gemini-2.5-pro"
-T_high_rounds=3;         T_high_turns=50; T_high_converge=true; T_high_verify=2
+T_high_rounds=3;         T_high_turns=30; T_high_build_turns=200; T_high_converge=true; T_high_verify=2
 T_high_effort="Maximise rigour: think deeply, enumerate edge cases, justify trade-offs, and aim for production quality."
 
 # --- Per-phase tool permissions ----------------------------------------------
 #   Claude: plan | acceptEdits | bypassPermissions | default
 #   Gemini: plan | auto_edit | default | yolo
 CLAUDE_PLAN_FLAGS="--permission-mode plan"
-CLAUDE_BUILD_FLAGS="--permission-mode acceptEdits --allowedTools Read,Write,Edit,Bash"
+CLAUDE_BUILD_FLAGS="--permission-mode bypassPermissions"
 GEMINI_PLAN_FLAGS="--approval-mode plan"
-GEMINI_BUILD_FLAGS="--approval-mode auto_edit"
+GEMINI_BUILD_FLAGS="--approval-mode yolo"
 
 # --- Behaviour ----------------------------------------------------------------
-HUMAN_GATES=true          # pause for y/n between major phases
+HUMAN_GATES=false         # pause for y/n between major phases
 RUN_TESTS=true            # integrate phase tries to build/run the project
 PARALLEL_BUILD=false      # both builders at once (only if tasks are file-disjoint)
 AUTO_COMMIT=true          # orchestrator commits code (clean, no AI co-author)
@@ -104,6 +104,7 @@ OPT_ROUNDS=""; OPT_LEAD=""    # explicit flag overrides (win over tier)
 START_TS="$(date +%Y%m%d-%H%M%S)"
 # Derived-from-tier (filled by apply_tier):
 CLAUDE_MODEL=""; GEMINI_MODEL=""; DEBATE_ROUNDS=""; CLAUDE_MAX_TURNS=""
+CLAUDE_BUILD_MAX_TURNS=""
 CONVERGENCE_CHECK=""; VERIFY_PASSES=""; EFFORT=""
 
 # =============================================================================
@@ -194,19 +195,28 @@ run_agent() {
   esac
   case "$agent:$mode" in
     claude:plan)  flags="$CLAUDE_PLAN_FLAGS" ;;
-    claude:build) flags="$CLAUDE_BUILD_FLAGS"; $AUTO_YOLO && flags="--permission-mode bypassPermissions --allowedTools Read,Write,Edit,Bash" ;;
+    claude:build) flags="$CLAUDE_BUILD_FLAGS" ;;  # bypassPermissions covers yolo too
     gemini:plan)  flags="$GEMINI_PLAN_FLAGS" ;;
-    gemini:build) flags="$GEMINI_BUILD_FLAGS"; $AUTO_YOLO && flags="--yolo" ;;
+    gemini:build) flags="$GEMINI_BUILD_FLAGS" ;;   # yolo covers auto_yolo too
     *) die "run_agent: bad mode '$mode'" ;;
   esac
-  # Claude turn budget scales with tier.
-  [[ "$agent" == claude && -n "$CLAUDE_MAX_TURNS" ]] && flags="$flags --max-turns $CLAUDE_MAX_TURNS"
 
   [[ "$AGENT_TIMEOUT" -gt 0 ]] && command -v timeout >/dev/null && tcmd=(timeout "$AGENT_TIMEOUT")
 
+  local model; [[ "$agent" == claude ]] && model="${CLAUDE_MODEL:-?}" || model="${GEMINI_MODEL:-?}"
+
+  # Build phase gets a much larger turn budget than planning.
+  if [[ "$agent" == claude ]]; then
+    if [[ "$mode" == build && -n "$CLAUDE_BUILD_MAX_TURNS" ]]; then
+      flags="$flags --max-turns $CLAUDE_BUILD_MAX_TURNS"
+    elif [[ "$mode" != build && -n "$CLAUDE_MAX_TURNS" ]]; then
+      flags="$flags --max-turns $CLAUDE_MAX_TURNS"
+    fi
+  fi
+
   while :; do
     attempt=$((attempt+1))
-    log "→ ${c_bold}${agent}${c_reset} [${mode}] ${c_dim}(${CLAUDE_MODEL:-}${GEMINI_MODEL:-})${c_reset} attempt ${attempt}/${MAX_RETRIES}"
+    log "→ ${c_bold}${agent}${c_reset} [${mode}] ${c_dim}(${model})${c_reset} attempt ${attempt}/${MAX_RETRIES}"
     if [[ -n "$ctx" && -f "$ctx" ]]; then
       out="$( cd "$PROJECT_DIR" && "${tcmd[@]}" "$bin" -p "$instruction" $model_flag $flags <"$ctx" 2>>"$LOG_FILE" )"
     else
@@ -215,7 +225,9 @@ run_agent() {
     rc=$?
     if [[ $rc -eq 0 ]]; then printf '%s' "$out"; sleep "$PACE_SECONDS"; return 0; fi
     if [[ $attempt -ge $MAX_RETRIES ]]; then
-      log "${c_red}‼ ${agent} failed after ${attempt} attempts (rc=${rc}). See $LOG_FILE${c_reset}"; return "$rc"
+      log "${c_red}‼ ${agent} failed after ${attempt} attempts (rc=${rc}). See $LOG_FILE${c_reset}"
+      printf '%s' "$out"   # emit whatever partial output we got
+      return "$rc"
     fi
     local wait_s=$(( BACKOFF_SECONDS * attempt ))
     warn "${agent} call failed (rc=${rc}) — likely a rate limit / transient error. Retrying in ${wait_s}s…"
@@ -318,13 +330,36 @@ file ownership is non-overlapping. If you see a conflict/gap output a short 'BLO
 
 _build_one() {
   local agent="$1"
-  local p="You are building part of a project. Read .orchestration/SPEC.md in full and
-.orchestration/PROGRESS.md for prior context. Implement ONLY the section under
-'## Task: ${agent^}'. Honour the Integration Contract and File/Directory Layout exactly.
-Create real files in this repository. Clean, commented, production-quality code. Do NOT
-touch files assigned to the other agent. Do NOT run git commit. End with a short summary
-of the files you created."
-  run_agent "$agent" build "$p" || die "${agent} build failed."
+  local spec_file="$ORCH_DIR/SPEC.md"
+  local progress_file="$ORCH_DIR/PROGRESS.md"
+
+  # Inject SPEC + PROGRESS directly so the agent doesn't burn a turn reading them.
+  local combined_ctx="$ORCH_DIR/_build_ctx_${agent}.tmp"
+  {
+    echo "# PROJECT SPECIFICATION (authoritative)"
+    cat "$spec_file"
+    echo
+    if [[ -f "$progress_file" ]]; then
+      echo "# PRIOR PROGRESS"
+      tail -n 80 "$progress_file"
+    fi
+  } >"$combined_ctx"
+
+  local p="You are building part of a software project.
+The project specification and prior progress are on STDIN — read them carefully.
+Implement ONLY the section '## Task: ${agent^}' from the spec.
+Honour the Integration Contract and File/Directory Layout exactly.
+Create every file listed in your task section. Real, complete, production-ready code.
+Do NOT touch files assigned to the other agent. Do NOT run git commit.
+After finishing, print a brief list of the files you created or modified."
+
+  run_agent "$agent" build "$p" "$combined_ctx"
+  local rc=$?
+  rm -f "$combined_ctx"
+  if [[ $rc -ne 0 ]]; then
+    warn "${agent} build returned rc=${rc}. Partial output committed above; continuing pipeline."
+  fi
+  return 0   # never kill the whole pipeline over one agent's build failure
 }
 
 phase_build() {
@@ -436,9 +471,10 @@ load_overrides() {
 apply_tier() {
   local t="$1"
   local mc="T_${t}_claude" mg="T_${t}_gemini" mr="T_${t}_rounds" mt="T_${t}_turns"
-  local mv="T_${t}_converge" mp="T_${t}_verify" me="T_${t}_effort"
+  local mb="T_${t}_build_turns" mv="T_${t}_converge" mp="T_${t}_verify" me="T_${t}_effort"
   CLAUDE_MODEL="${!mc}"; GEMINI_MODEL="${!mg}"; DEBATE_ROUNDS="${!mr}"
-  CLAUDE_MAX_TURNS="${!mt}"; CONVERGENCE_CHECK="${!mv}"; VERIFY_PASSES="${!mp}"; EFFORT="${!me}"
+  CLAUDE_MAX_TURNS="${!mt}"; CLAUDE_BUILD_MAX_TURNS="${!mb}"
+  CONVERGENCE_CHECK="${!mv}"; VERIFY_PASSES="${!mp}"; EFFORT="${!me}"
   # Explicit flags beat the tier.
   [[ -n "$OPT_ROUNDS" ]] && DEBATE_ROUNDS="$OPT_ROUNDS"
   [[ -n "$OPT_LEAD"   ]] && LEAD="$OPT_LEAD"
@@ -540,8 +576,8 @@ banner() {
   printf '  %sBrief :%s %s\n'  "$c_bold" "$c_reset" "$IDEA" >&2
   printf '  %sDir   :%s %s\n'  "$c_bold" "$c_reset" "$PROJECT_DIR" >&2
   printf '  %sModels:%s claude=%s  gemini=%s\n' "$c_bold" "$c_reset" "$CLAUDE_MODEL" "$GEMINI_MODEL" >&2
-  printf '  %sFlow  :%s rounds=%s turns=%s verify=%s lead=%s gates=%s yolo=%s\n' \
-    "$c_bold" "$c_reset" "$DEBATE_ROUNDS" "$CLAUDE_MAX_TURNS" "$VERIFY_PASSES" "$LEAD" "$HUMAN_GATES" "$AUTO_YOLO" >&2
+  printf '  %sFlow  :%s rounds=%s plan_turns=%s build_turns=%s verify=%s lead=%s gates=%s yolo=%s\n' \
+    "$c_bold" "$c_reset" "$DEBATE_ROUNDS" "$CLAUDE_MAX_TURNS" "$CLAUDE_BUILD_MAX_TURNS" "$VERIFY_PASSES" "$LEAD" "$HUMAN_GATES" "$AUTO_YOLO" >&2
   # Resume hint
   if [[ -s "$STATE_FILE" ]]; then
     printf '  %sResume:%s already done → %s\n' "$c_cyan" "$c_reset" "$(paste -sd', ' "$STATE_FILE")" >&2
