@@ -43,6 +43,7 @@ set -uo pipefail   # NOT -e: agent calls can fail (rate limits) and we retry.
 # -----------------------------------------------------------------------------
 CLAUDE_BIN="claude"          # Claude Code CLI command
 GEMINI_BIN="gemini"          # second-agent command (→ antigravity after migration)
+GEMINI_VERTEX_FLAGS=""       # extra flags for Vertex AI, e.g. "--project my-proj --location us-central1"
 
 DEFAULT_TIER="med"           # used when no tier word is given
 
@@ -59,15 +60,15 @@ DEFAULT_TIER="med"           # used when no tier word is given
 #             Auto-3 routing). After the Antigravity migration, set the
 #             Antigravity model strings here instead.
 T_low_claude="haiku";    T_low_gemini="gemini-2.5-flash"
-T_low_rounds=1;          T_low_turns=8;   T_low_build_turns=40;  T_low_converge=false; T_low_verify=1
+T_low_rounds=1;          T_low_turns=8;   T_low_build_turns=40;  T_low_converge=false; T_low_review_loops=1
 T_low_effort="Optimise for speed and a minimal working solution. Keep analysis brief; do not gold-plate."
 
 T_med_claude="sonnet";   T_med_gemini="gemini-2.5-pro"
-T_med_rounds=2;          T_med_turns=15;  T_med_build_turns=100; T_med_converge=true;  T_med_verify=2
+T_med_rounds=2;          T_med_turns=15;  T_med_build_turns=100; T_med_converge=true;  T_med_review_loops=2
 T_med_effort="Balance speed with correctness. Cover the important edge cases and keep the design clean."
 
 T_high_claude="opus";    T_high_gemini="gemini-2.5-pro"
-T_high_rounds=3;         T_high_turns=30; T_high_build_turns=200; T_high_converge=true; T_high_verify=2
+T_high_rounds=3;         T_high_turns=30; T_high_build_turns=200; T_high_converge=true; T_high_review_loops=3
 T_high_effort="Maximise rigour: think deeply, enumerate edge cases, justify trade-offs, and aim for production quality."
 
 # --- Per-phase tool permissions ----------------------------------------------
@@ -85,7 +86,7 @@ PARALLEL_BUILD=false      # both builders at once (only if tasks are file-disjoi
 AUTO_COMMIT=true          # orchestrator commits code (clean, no AI co-author)
 JOURNAL_DIGEST=false      # true = spend a cheap model call to summarise each phase
                           # false = free: capture each agent's own printed summary
-LEAD="claude"             # which agent integrates at the end
+LEAD="gemini"             # Gemini builds and integrates; Claude critiques and approves
 AUTO_YOLO=false           # set by --yolo: no gates + full auto-approval
 
 # --- Reliability / pacing -----------------------------------------------------
@@ -105,7 +106,7 @@ START_TS="$(date +%Y%m%d-%H%M%S)"
 # Derived-from-tier (filled by apply_tier):
 CLAUDE_MODEL=""; GEMINI_MODEL=""; DEBATE_ROUNDS=""; CLAUDE_MAX_TURNS=""
 CLAUDE_BUILD_MAX_TURNS=""
-CONVERGENCE_CHECK=""; VERIFY_PASSES=""; EFFORT=""
+CONVERGENCE_CHECK=""; REVIEW_LOOPS=""; EFFORT=""
 
 # =============================================================================
 # 1. UTILITIES   (all status output → STDERR so it never pollutes captured stdout)
@@ -181,7 +182,7 @@ journal_phase() {
 # -----------------------------------------------------------------------------
 run_agent() {
   local agent="$1" mode="$2" instruction="$3" ctx="${4:-}"
-  local bin flags model_flag out rc attempt=0 tcmd=()
+  local bin flags extra_flags="" model_flag out rc attempt=0 tcmd=()
 
   # Tier effort guidance rides along on every call.
   [[ -n "$EFFORT" ]] && instruction="${instruction}
@@ -190,7 +191,7 @@ run_agent() {
 
   case "$agent" in
     claude) bin="$CLAUDE_BIN"; model_flag="${CLAUDE_MODEL:+--model $CLAUDE_MODEL}" ;;
-    gemini) bin="$GEMINI_BIN"; model_flag="${GEMINI_MODEL:+--model $GEMINI_MODEL}" ;;
+    gemini) bin="$GEMINI_BIN"; model_flag="${GEMINI_MODEL:+--model $GEMINI_MODEL}"; extra_flags="$GEMINI_VERTEX_FLAGS" ;;
     *) die "run_agent: unknown agent '$agent'" ;;
   esac
   case "$agent:$mode" in
@@ -218,9 +219,9 @@ run_agent() {
     attempt=$((attempt+1))
     log "→ ${c_bold}${agent}${c_reset} [${mode}] ${c_dim}(${model})${c_reset} attempt ${attempt}/${MAX_RETRIES}"
     if [[ -n "$ctx" && -f "$ctx" ]]; then
-      out="$( cd "$PROJECT_DIR" && "${tcmd[@]}" "$bin" -p "$instruction" $model_flag $flags <"$ctx" 2>>"$LOG_FILE" )"
+      out="$( cd "$PROJECT_DIR" && "${tcmd[@]}" "$bin" -p "$instruction" $model_flag $flags $extra_flags <"$ctx" 2>>"$LOG_FILE" )"
     else
-      out="$( cd "$PROJECT_DIR" && "${tcmd[@]}" "$bin" -p "$instruction" $model_flag $flags </dev/null 2>>"$LOG_FILE" )"
+      out="$( cd "$PROJECT_DIR" && "${tcmd[@]}" "$bin" -p "$instruction" $model_flag $flags $extra_flags </dev/null 2>>"$LOG_FILE" )"
     fi
     rc=$?
     if [[ $rc -eq 0 ]]; then printf '%s' "$out"; sleep "$PACE_SECONDS"; return 0; fi
@@ -240,90 +241,98 @@ run_agent() {
 # =============================================================================
 phase_research() {
   is_done research && { ok "Research — cached, skipping."; return; }
-  say "PHASE 1 · Independent research"
+  say "PHASE 1 · Gemini research"
   local p="You are a senior software architect. Read .orchestration/IDEA.md for the brief.
 Produce a rigorous architecture proposal: tech stack (justified), component breakdown,
 data model, key risks/edge cases, and a phased implementation plan. Concrete and
 opinionated. Do NOT write code yet. Output Markdown only."
-  run_agent claude plan "$p" >"$ORCH_DIR/research_claude.md" || die "Claude research failed."
   run_agent gemini plan "$p" >"$ORCH_DIR/research_gemini.md" || die "Gemini research failed."
-  ok "Two independent proposals written."
-  journal_phase "Phase 1 · Research (Claude)" "$ORCH_DIR/research_claude.md"
+  ok "Gemini proposal written."
+  journal_phase "Phase 1 · Research (Gemini)" "$ORCH_DIR/research_gemini.md"
   git_snapshot "orchestration: phase 1 research"
   mark_done research
 }
 
 phase_debate() {
   is_done debate && { ok "Debate — cached, skipping."; return; }
-  say "PHASE 2 · Cross-debate (${DEBATE_ROUNDS} round(s))"
+  say "PHASE 2 · Claude critiques → Gemini revises (${DEBATE_ROUNDS} round(s))"
   local round
   for (( round=1; round<=DEBATE_ROUNDS; round++ )); do
-    log "Round ${round}: each agent critiques the other's current proposal."
-    local crit="You are a principal engineer doing an adversarial design review. The other
-architect's proposal is on STDIN. Identify concrete flaws, missing edge cases,
-security/perf blind spots, and unstated assumptions, then list specific actionable
-improvements. Be blunt and specific. Markdown only."
+    log "Round ${round}: Claude critiques Gemini's proposal."
+    local crit="You are a principal engineer doing an adversarial design review.
+Gemini's architecture proposal is on STDIN. Identify concrete flaws, missing edge cases,
+security/perf blind spots, and unstated assumptions. List specific actionable improvements.
+Be blunt and concise. Markdown only."
     run_agent claude plan "$crit" "$ORCH_DIR/research_gemini.md" >"$ORCH_DIR/critique_by_claude_r${round}.md" || die "Claude critique failed."
-    run_agent gemini plan "$crit" "$ORCH_DIR/research_claude.md" >"$ORCH_DIR/critique_by_gemini_r${round}.md" || die "Gemini critique failed."
 
-    local revise="On STDIN is your previous proposal followed by a peer critique of it
-(delimited). Produce a REVISED proposal that fixes valid points and explicitly notes any
-critique you reject and why. Markdown only."
-    { echo "## YOUR PREVIOUS PROPOSAL"; cat "$ORCH_DIR/research_claude.md"
-      echo; echo "## PEER CRITIQUE OF IT"; cat "$ORCH_DIR/critique_by_gemini_r${round}.md"; } >"$ORCH_DIR/_rev_c.tmp"
-    run_agent claude plan "$revise" "$ORCH_DIR/_rev_c.tmp" >"$ORCH_DIR/research_claude.md.new" \
-      && mv "$ORCH_DIR/research_claude.md.new" "$ORCH_DIR/research_claude.md"
+    log "Round ${round}: Gemini revises based on Claude's critique."
     { echo "## YOUR PREVIOUS PROPOSAL"; cat "$ORCH_DIR/research_gemini.md"
-      echo; echo "## PEER CRITIQUE OF IT"; cat "$ORCH_DIR/critique_by_claude_r${round}.md"; } >"$ORCH_DIR/_rev_g.tmp"
-    run_agent gemini plan "$revise" "$ORCH_DIR/_rev_g.tmp" >"$ORCH_DIR/research_gemini.md.new" \
+      echo; echo "## CRITIQUE (address these)"; cat "$ORCH_DIR/critique_by_claude_r${round}.md"; } >"$ORCH_DIR/_rev_g.tmp"
+    run_agent gemini plan "On STDIN is your previous proposal followed by a critique.
+Produce a REVISED proposal that fixes valid points and explicitly notes any critique you
+reject and why. Markdown only." "$ORCH_DIR/_rev_g.tmp" >"$ORCH_DIR/research_gemini.md.new" \
       && mv "$ORCH_DIR/research_gemini.md.new" "$ORCH_DIR/research_gemini.md"
-    rm -f "$ORCH_DIR"/_rev_*.tmp
+    rm -f "$ORCH_DIR/_rev_g.tmp"
 
     if [[ "$CONVERGENCE_CHECK" == true ]]; then
-      { echo "## PLAN A"; cat "$ORCH_DIR/research_claude.md"; echo; echo "## PLAN B"; cat "$ORCH_DIR/research_gemini.md"; } >"$ORCH_DIR/_conv.tmp"
+      { echo "## REVISED PROPOSAL"; cat "$ORCH_DIR/research_gemini.md"
+        echo; echo "## YOUR CRITIQUE (round ${round})"; cat "$ORCH_DIR/critique_by_claude_r${round}.md"; } >"$ORCH_DIR/_conv.tmp"
       local verdict
-      verdict="$(run_agent claude plan "On STDIN are two revised plans. Do they materially agree on stack, structure and approach? Reply with exactly one word: CONVERGED or CONTINUE." "$ORCH_DIR/_conv.tmp")"
+      verdict="$(run_agent claude plan "On STDIN is Gemini's revised proposal and your previous critique of it.
+Has the proposal sufficiently addressed your concerns? Reply with exactly one word: APPROVED or CONTINUE." "$ORCH_DIR/_conv.tmp")"
       rm -f "$ORCH_DIR/_conv.tmp"
-      log "Convergence verdict: ${verdict}"
-      grep -qi CONVERGED <<<"$verdict" && { ok "Plans converged early (round ${round})."; break; }
+      log "Approval verdict: ${verdict}"
+      grep -qi APPROVED <<<"$verdict" && { ok "Proposal approved by Claude (round ${round})."; break; }
     fi
   done
-  journal_phase "Phase 2 · Debate" "$ORCH_DIR/research_claude.md"
+  journal_phase "Phase 2 · Debate" "$ORCH_DIR/research_gemini.md"
   git_snapshot "orchestration: phase 2 debate"
   mark_done debate
 }
 
 phase_consensus() {
   is_done consensus && { ok "Consensus — cached, skipping."; return; }
-  say "PHASE 3 · Consensus spec + task division"
+  say "PHASE 3 · Gemini writes spec → Claude reviews"
   { echo "# BRIEF"; cat "$ORCH_DIR/IDEA.md"
-    echo; echo "# PLAN — CLAUDE"; cat "$ORCH_DIR/research_claude.md"
-    echo; echo "# PLAN — GEMINI"; cat "$ORCH_DIR/research_gemini.md"; } >"$ORCH_DIR/_cons.tmp"
-  local p="You are the lead architect. STDIN has the brief and two peer-reviewed plans.
-Merge them into ONE definitive spec with these exact headings, in order:
+    echo; echo "# RESEARCH"; cat "$ORCH_DIR/research_gemini.md"; } >"$ORCH_DIR/_cons.tmp"
+  local p="You are the lead architect. STDIN has the brief and your peer-reviewed research.
+Generate a definitive spec with these exact headings, in order:
 
 # Specification
-(unified architecture, stack, data model, conventions)
+(architecture, stack, data model, conventions)
 # File / Directory Layout
 (the intended tree so both builders agree on structure)
 # Task Division
 ## Task: Claude
-(precise list of files/modules CLAUDE builds)
+(small critical tasks only — Claude is used sparingly; keep this list short)
 ## Task: Gemini
-(precise list of files/modules GEMINI builds — must NOT overlap Claude's files)
+(bulk of the implementation — files/modules Gemini builds; must NOT overlap Claude's)
 # Integration Contract
-(the interfaces/APIs/types where the two halves meet)
+(interfaces/APIs/types where the two halves meet)
 
-Make the two task sets touch DISJOINT files wherever possible. Markdown only."
-  run_agent "$LEAD" plan "$p" "$ORCH_DIR/_cons.tmp" >"$ORCH_DIR/SPEC.md" || die "Consensus generation failed."
+Markdown only."
+  run_agent gemini plan "$p" "$ORCH_DIR/_cons.tmp" >"$ORCH_DIR/SPEC.md" || die "Spec generation failed."
   rm -f "$ORCH_DIR/_cons.tmp"
-  local other; [[ "$LEAD" == claude ]] && other=gemini || other=claude
-  run_agent "$other" plan "STDIN is the final consensus spec. Confirm the task split is buildable and
-file ownership is non-overlapping. If you see a conflict/gap output a short 'BLOCKERS' list, else 'ACKNOWLEDGED'. Markdown only." \
-    "$ORCH_DIR/SPEC.md" >"$ORCH_DIR/spec_ack_${other}.md" || warn "Ack step failed (non-fatal)."
-  ok "Unified spec → .orchestration/SPEC.md"; cat "$ORCH_DIR/SPEC.md" >&2
-  journal_phase "Phase 3 · Consensus spec" "$ORCH_DIR/SPEC.md"
-  git_snapshot "orchestration: phase 3 consensus spec"
+
+  # Claude reviews the spec once — outputs critique or APPROVED (saves tokens vs a full rewrite).
+  local review
+  review="$(run_agent claude plan "Review the spec on STDIN for gaps, ambiguities, missing edge cases,
+and security issues. Output a concise numbered list of concrete fixes needed.
+If the spec is solid, reply with exactly: APPROVED. Markdown only." "$ORCH_DIR/SPEC.md")"
+  if ! grep -qi "^APPROVED" <<<"$review"; then
+    log "Claude spec feedback received — Gemini applying…"
+    { echo "# SPEC"; cat "$ORCH_DIR/SPEC.md"
+      echo; echo "# CLAUDE FEEDBACK (apply these)"; echo "$review"; } >"$ORCH_DIR/_spec_fix.tmp"
+    run_agent gemini plan "On STDIN is your spec followed by reviewer feedback.
+Apply the feedback and output the corrected spec. Keep all four headings. Markdown only." \
+      "$ORCH_DIR/_spec_fix.tmp" >"$ORCH_DIR/SPEC.md.new" \
+      && mv "$ORCH_DIR/SPEC.md.new" "$ORCH_DIR/SPEC.md"
+    rm -f "$ORCH_DIR/_spec_fix.tmp"
+  fi
+
+  ok "Spec → .orchestration/SPEC.md"; cat "$ORCH_DIR/SPEC.md" >&2
+  journal_phase "Phase 3 · Spec" "$ORCH_DIR/SPEC.md"
+  git_snapshot "orchestration: phase 3 spec"
   mark_done consensus
   confirm "Review SPEC.md above. Proceed to BUILD?" || die "Stopped before build. Re-run in this dir to resume."
 }
@@ -383,24 +392,38 @@ phase_build() {
 }
 
 phase_verify() {
-  is_done verify && { ok "Verify — cached, skipping."; return; }
-  say "PHASE 5 · Cross-verification (${VERIFY_PASSES} pass(es))"
+  is_done verify && { ok "Review — cached, skipping."; return; }
+  say "PHASE 5 · Claude reviews → Gemini fixes (max ${REVIEW_LOOPS} loop(s))"
   : >"$ORCH_DIR/verify_log.md"
-  local vp="Read .orchestration/SPEC.md, then review the ENTIRE repository against it.
-Find and FIX in place: bugs, security flaws, missing error handling, contract violations
-between the two halves, dead/incomplete code. Minimal, correct edits directly to files.
-Do NOT commit. Print a concise changelog of what you fixed."
-  # Sequential on purpose (two passes over the same repo would conflict if parallel).
-  log "Gemini hardening pass…"
-  run_agent gemini build "$vp" | tee -a "$ORCH_DIR/verify_log.md" >/dev/null || warn "Gemini verify had issues."
-  git_snapshot "verify: Gemini hardening pass"
-  if [[ "$VERIFY_PASSES" -ge 2 ]]; then
-    log "Claude hardening pass…"
-    run_agent claude build "$vp" | tee -a "$ORCH_DIR/verify_log.md" >/dev/null || warn "Claude verify had issues."
-    git_snapshot "verify: Claude hardening pass"
-  fi
-  ok "Cross-verification complete."
-  journal_phase "Phase 5 · Verify" "$ORCH_DIR/verify_log.md"
+  local pass approved=false critique
+
+  for (( pass=1; pass<=REVIEW_LOOPS; pass++ )); do
+    log "Review pass ${pass}/${REVIEW_LOOPS}: Claude auditing the codebase…"
+    critique="$(run_agent claude plan "Read .orchestration/SPEC.md and audit the ENTIRE repository against it.
+Output a concise numbered list of concrete issues: bugs, contract violations, missing error
+handling, security flaws, incomplete stubs. Be specific (file + line where possible).
+If the codebase is solid and complete, reply with exactly: APPROVED
+Do NOT write or edit any files.")"
+    printf '%s\n\n' "$critique" >>"$ORCH_DIR/verify_log.md"
+
+    if grep -qi "^APPROVED" <<<"$critique"; then
+      ok "Claude approved the codebase (pass ${pass})."; approved=true; break
+    fi
+
+    log "Issues found — Gemini applying fixes (pass ${pass})…"
+    { echo "# SPEC"; cat "$ORCH_DIR/SPEC.md"
+      echo; echo "# CLAUDE CODE REVIEW — fix all of these"; echo "$critique"; } >"$ORCH_DIR/_fix.tmp"
+    run_agent gemini build "Fix every issue in the CLAUDE CODE REVIEW section on STDIN.
+Minimal, correct edits directly to files. Do NOT commit.
+Print a concise changelog of what you fixed." "$ORCH_DIR/_fix.tmp" \
+      | tee -a "$ORCH_DIR/verify_log.md" >/dev/null || warn "Gemini fix pass ${pass} had issues."
+    rm -f "$ORCH_DIR/_fix.tmp"
+    git_snapshot "review: Gemini fix pass ${pass}"
+  done
+
+  $approved || warn "Max review passes (${REVIEW_LOOPS}) reached — manual inspection recommended."
+  ok "Review loop complete."
+  journal_phase "Phase 5 · Review" "$ORCH_DIR/verify_log.md"
   mark_done verify
 }
 
@@ -471,10 +494,10 @@ load_overrides() {
 apply_tier() {
   local t="$1"
   local mc="T_${t}_claude" mg="T_${t}_gemini" mr="T_${t}_rounds" mt="T_${t}_turns"
-  local mb="T_${t}_build_turns" mv="T_${t}_converge" mp="T_${t}_verify" me="T_${t}_effort"
+  local mb="T_${t}_build_turns" mv="T_${t}_converge" ml="T_${t}_review_loops" me="T_${t}_effort"
   CLAUDE_MODEL="${!mc}"; GEMINI_MODEL="${!mg}"; DEBATE_ROUNDS="${!mr}"
   CLAUDE_MAX_TURNS="${!mt}"; CLAUDE_BUILD_MAX_TURNS="${!mb}"
-  CONVERGENCE_CHECK="${!mv}"; VERIFY_PASSES="${!mp}"; EFFORT="${!me}"
+  CONVERGENCE_CHECK="${!mv}"; REVIEW_LOOPS="${!ml}"; EFFORT="${!me}"
   # Explicit flags beat the tier.
   [[ -n "$OPT_ROUNDS" ]] && DEBATE_ROUNDS="$OPT_ROUNDS"
   [[ -n "$OPT_LEAD"   ]] && LEAD="$OPT_LEAD"
@@ -576,8 +599,8 @@ banner() {
   printf '  %sBrief :%s %s\n'  "$c_bold" "$c_reset" "$IDEA" >&2
   printf '  %sDir   :%s %s\n'  "$c_bold" "$c_reset" "$PROJECT_DIR" >&2
   printf '  %sModels:%s claude=%s  gemini=%s\n' "$c_bold" "$c_reset" "$CLAUDE_MODEL" "$GEMINI_MODEL" >&2
-  printf '  %sFlow  :%s rounds=%s plan_turns=%s build_turns=%s verify=%s lead=%s gates=%s yolo=%s\n' \
-    "$c_bold" "$c_reset" "$DEBATE_ROUNDS" "$CLAUDE_MAX_TURNS" "$CLAUDE_BUILD_MAX_TURNS" "$VERIFY_PASSES" "$LEAD" "$HUMAN_GATES" "$AUTO_YOLO" >&2
+  printf '  %sFlow  :%s rounds=%s plan_turns=%s build_turns=%s review_loops=%s lead=%s gates=%s yolo=%s\n' \
+    "$c_bold" "$c_reset" "$DEBATE_ROUNDS" "$CLAUDE_MAX_TURNS" "$CLAUDE_BUILD_MAX_TURNS" "$REVIEW_LOOPS" "$LEAD" "$HUMAN_GATES" "$AUTO_YOLO" >&2
   # Resume hint
   if [[ -s "$STATE_FILE" ]]; then
     printf '  %sResume:%s already done → %s\n' "$c_cyan" "$c_reset" "$(paste -sd', ' "$STATE_FILE")" >&2
