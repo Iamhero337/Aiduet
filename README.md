@@ -1,66 +1,73 @@
 # Aiduet: buildit
 
-A tiered two-agent build orchestrator that leverages the combined power of **Claude Code** and **Gemini CLI** to research, debate, and build software autonomously.
+A tiered two-agent build orchestrator where **Gemini** thinks and builds, and **Claude** critiques and approves.
 
-## Overview
+## How it works
 
-`buildit` is the core tool of the Aiduet project. It orchestrates a multi-phase pipeline where two independent AI agents (Claude and Gemini) collaborate to deliver high-quality code.
+Gemini does the heavy lifting — research, planning, and all code. Claude acts as a sparse senior reviewer: it critiques, and Gemini fixes. Claude never writes files.
 
-### The Pipeline
-1.  **Research**: Systematically map requirements and codebase.
-2.  **Cross-Debate**: Agents critique each other's plans to find the best approach.
-3.  **Consensus + Task-Split**: Agreement on the architecture and breakdown of work.
-4.  **Build**: Concurrent or sequential implementation of tasks.
-5.  **Cross-Verify**: Each agent reviews the other's work.
-6.  **Integrate + Test**: Final assembly and verification of the solution.
-7.  **Finalize**: Cleanup and completion.
+### Pipeline
 
-## Features
+1. **Research** — Gemini proposes the architecture
+2. **Debate** — Claude critiques → Gemini revises (N rounds, exits early if Claude approves)
+3. **Spec** — Gemini writes the spec → Claude reviews once → Gemini applies feedback
+4. **Build** — Gemini builds the bulk; Claude gets only small critical tasks
+5. **Review loop** — Claude audits the codebase → Gemini fixes → repeat until Claude says `APPROVED` (or max loops hit)
+6. **Integrate** — Gemini wires everything together, adds README, runs tests
+7. **Finalize** — clean git history, summary
 
--   **Tiered Intelligence**: Choose between `low`, `med`, or `high` tiers to balance speed, cost, and rigor.
--   **Resumable State**: Progress is tracked in `./.orchestration/`. If a run is interrupted, it resumes exactly where it left off.
--   **Git-Native**: Agents are instructed not to commit; the orchestrator handles clean commits without AI co-author trailers.
--   **Configurable**: Global configuration in `~/.config/ai-duet/config` and per-project overrides via `.aiduetrc`.
+## Usage
+
+```bash
+buildit "what to build"              # med tier (default)
+buildit low "what to build"          # fast/cheap — 1 debate round, 1 review loop
+buildit high "what to build"         # max rigor — 3 rounds, 3 review loops
+buildit status                       # progress for the current directory
+buildit reset                        # wipe state and start fresh
+```
+
+Run from inside the project directory. State lives in `.orchestration/` — re-running resumes automatically.
+
+## Tiers
+
+| Tier | Claude model | Gemini model | Debate rounds | Review loops |
+|------|-------------|--------------|---------------|--------------|
+| low  | haiku | gemini-2.5-flash | 1 | 1 |
+| med  | sonnet | gemini-2.5-pro | 2 | 2 |
+| high | opus | gemini-2.5-pro | 3 | 3 |
 
 ## Installation
-
-Run the provided installation script to set up `buildit` as a global command:
 
 ```bash
 ./install.sh
 ```
 
-This script will:
-1.  Install `buildit` to `~/.local/bin/`.
-2.  Add `~/.local/bin` to your `PATH` via `~/.bashrc`.
-3.  Create a starter config at `~/.config/ai-duet/config`.
-4.  Install bash tab-completion for `buildit`.
-
-## Usage
-
-```bash
-# Start a new build with medium rigor (default)
-buildit "a FastAPI todo API with JWT auth"
-
-# Start a high-rigor build
-buildit high "refactor the database layer to use SQLAlchemy 2.0"
-
-# Check status of the current run
-buildit status
-
-# Reset the orchestration state for the current directory
-buildit reset
-```
+Installs `buildit` to `~/.local/bin/`, adds it to `PATH`, creates a starter config, and sets up tab-completion.
 
 ## Requirements
 
--   [Claude Code](https://github.com/anthropics/claude-code)
--   [Gemini CLI](https://github.com/google/gemini-cli) (Note: Migration to Antigravity CLI is recommended before 2026-06-18)
--   `git`
+- [Claude Code](https://github.com/anthropics/claude-code)
+- [Gemini CLI](https://github.com/google/gemini-cli) (v0.47+, Vertex AI supported)
+- `git`
 
 ## Configuration
 
-The default configuration can be found in `~/.config/ai-duet/config`. You can adjust model selections, tiers, and behavioral settings (like `HUMAN_GATES` and `AUTO_COMMIT`) there.
+`~/.config/ai-duet/config` — override anything, e.g.:
+
+```sh
+# Vertex AI
+GEMINI_VERTEX_FLAGS="--project my-gcp-project --location us-central1"
+
+# Models
+T_high_claude="claude-fable-5"
+T_high_gemini="gemini-2.5-pro"
+
+# Behaviour
+PACE_SECONDS=6       # slow down if hitting rate limits
+AUTO_COMMIT=true
+```
+
+Per-project overrides go in `.aiduetrc` at the project root. CLI flags win over everything.
 
 ---
-*Note: Aiduet is designed to stay under your control. The `.orchestration/` directory is automatically git-ignored to keep your history clean.*
+*`.orchestration/` is git-ignored — journals and state never clutter your history.*
